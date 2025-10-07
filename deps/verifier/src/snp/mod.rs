@@ -11,6 +11,8 @@ use openssl::{
     x509::{self, X509},
 };
 use reqwest::{get, Response as ReqwestResponse, StatusCode};
+use std::{path::Path};
+
 use serde;
 use serde_json::json;
 use sev::{
@@ -217,14 +219,24 @@ impl Verifier for Snp {
                 vek.clone()
             }
 
-            // No certificate chain provided, so we need to request the VCEK from KDS
+            // No certificate chain provided, so we need to check for local certificates or request the VCEK from KDS
             _ => {
-                // Get VCEK from KDS
-                let vcek_buf = fetch_vcek_from_kds(report, proc_gen.clone())
-                    .await
-                    .context("Failed to fetch VCEK from KDS")?;
-                let vcek = Certificate::from_bytes(&vcek_buf)
-                    .context("Failed to convert KDS VCEK into certificate")?;
+                let vcek = match read_vcek_from_cache(&report) {
+                    Ok(cert) => {
+                        log::info!("Successfully read VCEK from cache");
+                        Certificate::from_bytes(&cert)
+                            .context("Failed to convert cached VCEK into certificate")?
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to read VCEK from cache: {}, fetching from KDS", e);
+                        // Get VCEK from KDS
+                        let vcek_buf = fetch_vcek_from_kds(report, proc_gen.clone())
+                            .await
+                            .context("Failed to fetch VCEK from KDS")?;
+                        Certificate::from_bytes(&vcek_buf)
+                            .context("Failed to convert KDS VCEK into certificate")?
+                    }
+                };
 
                 let chain = Chain {
                     ca: CaChain {
@@ -237,7 +249,7 @@ impl Verifier for Snp {
                 // Verify the chain and return vek if succesful
                 chain
                     .verify()
-                    .context("Certificate chain from KDS failed verification")?;
+                    .context("Certificate chain failed verification")?;
 
                 // Return the vcek
                 vcek.clone()
@@ -285,6 +297,76 @@ impl Verifier for Snp {
         let json = json!(claims_map);
         Ok(vec![(json, "cpu".to_string())])
     }
+}
+
+/// Reads the first VCEK certificate from the filesystem cache that successfully verifies against the given report.
+/// Returns the certificate in DER format as Vec<u8>.
+/// This function determines the processor generation from the report and reads from the appropriate subdirectory
+/// (/etc/kbs/snp/ek/milan, /etc/kbs/snp/ek/genoa, or /etc/kbs/snp/ek/turin).
+pub fn read_vcek_from_cache(report: &AttestationReport) -> Result<Vec<u8>> {
+    // Get the processor generation from the report
+    let proc_gen = get_processor_generation(report)?;
+    
+    // Determine the processor-specific directory
+    let proc_dir = match proc_gen {
+        ProcessorGeneration::Milan => "milan",
+        ProcessorGeneration::Genoa => "genoa", 
+        ProcessorGeneration::Turin => "turin",
+    };
+    
+    let vcek_dir = Path::new("/etc/kbs/snp/ek").join(proc_dir);
+
+    if !vcek_dir.is_dir() {
+        bail!("{} directory not found", vcek_dir.display());
+    }
+
+    for entry in std::fs::read_dir(&vcek_dir)? {
+        let entry = match entry {
+            Result::Ok(de) => de,
+            Err(e) => {
+                log::warn!("{:?}", e);
+                continue;
+            },
+        };
+        let path = entry.path();
+        
+        // Check if it's a file
+        if !path.is_file() {
+            continue;
+        }
+
+        // Try to read the file
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(e) => {
+                log::warn!("Failed to read {}: {}", path.display(), e);
+                continue;
+            }
+        };
+
+        // Check if the file is a valid x509 DER certificate
+        let vcek_cert = match Certificate::from_bytes(&data) {
+            Ok(cert) => cert,
+            Err(e) => {
+                log::warn!("Invalid certificate format in {}: {}", path.display(), e);
+                continue;
+            }
+        };
+
+        // Try to verify the report signature with this certificate
+        match (&vcek_cert, report).verify() {
+            Ok(_) => {
+                log::info!("Found VCEK certificate that verifies report: {}", path.display());
+                return Ok(data);
+            }
+            Err(e) => {
+                log::debug!("Certificate {} does not verify report: {}", path.display(), e);
+                continue;
+            }
+        }
+    }
+
+    bail!("No VCEK certificate found in {} directory that verifies the report", vcek_dir.display());
 }
 
 /// Retrieves the octet string value for a given OID from a certificate's extensions.
